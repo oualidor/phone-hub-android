@@ -14,7 +14,7 @@ Designed to work in tandem with the **Phone HUB GNOME Extension**, this app turn
 ## 🛠️ Installation & Setup
 
 1.  **Install the App:** Clone this repository and build the project in Android Studio, or install the APK on your Android device.
-2.  **Install the Desktop Extension:** Download and install the [Phone HUB GNOME Extension](https://github.com/oualidkhial/phone-hub-extension) (link to be updated).
+2.  **Install the Desktop Extension:** Download and install the [Phone HUB GNOME Extension](https://github.com/oualidor/gnome-phone-hub) (link to be updated).
 3.  **Grant Permissions:** Open the app and grant the necessary permissions:
     *   **SMS:** To read and sync messages.
     *   **Phone/Call Logs:** To monitor incoming calls.
