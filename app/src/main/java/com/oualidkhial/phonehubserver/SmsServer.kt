@@ -1,6 +1,7 @@
 package com.oualidkhial.phonehubserver
 
 import android.content.Context
+import android.content.Intent
 import android.util.Log
 import io.ktor.server.application.call
 import io.ktor.server.cio.CIO
@@ -34,6 +35,11 @@ import io.ktor.server.request.receiveText
 private const val PREFS_NAME = "PhoneHubPrefs"
 private const val KEY_IS_AUTHORIZED = "isAuthorized"
 private const val KEY_CONNECTED_CLIENT_IP = "connectedClientIp"
+private const val KEY_REST_TOKEN = "restToken"
+private const val KEY_WS_TOKEN = "wsToken"
+private const val KEY_CONNECTED_DEVICE_NAME = "connectedDeviceName"
+
+data class PairingRequest(val ip: String, val deviceName: String)
 
 
 object SmsServer {
@@ -43,9 +49,24 @@ object SmsServer {
     val isAuthorized = AtomicBoolean(false)
     val authorizedState = kotlinx.coroutines.flow.MutableStateFlow(false)
     var connectedClientIp: String? = null
+    var connectedDeviceName: String? = null
     val clientIpState = kotlinx.coroutines.flow.MutableStateFlow<String?>(null)
+    val deviceNameState = kotlinx.coroutines.flow.MutableStateFlow<String?>(null)
     val isClientConnectedState = kotlinx.coroutines.flow.MutableStateFlow(false)
-    val pairingRequests = MutableSharedFlow<String>(extraBufferCapacity = 1)
+    val pairingRequests = kotlinx.coroutines.flow.MutableStateFlow<PairingRequest?>(null)
+    
+    var restToken: String? = null
+    var wsToken: String? = null
+
+    private var pendingRestToken: String? = null
+    private var pendingWsToken: String? = null
+
+    fun getPendingRestToken() = pendingRestToken
+    fun getPendingWsToken() = pendingWsToken
+
+    fun getRestToken(context: Context): String? {
+        return restToken ?: getPrefs(context).getString(KEY_REST_TOKEN, null)
+    }
 
     // WebSocket connections
     private val webSocketSessions = java.util.Collections.synchronizedList(mutableListOf<DefaultWebSocketServerSession>())
@@ -126,31 +147,67 @@ object SmsServer {
     private fun getPrefs(context: Context): SharedPreferences =
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
-    private fun saveAuthState(context: Context, authorized: Boolean, clientIp: String? = null) {
+    private fun saveAuthState(context: Context, authorized: Boolean, clientIp: String? = null, rToken: String? = null, wToken: String? = null) {
         getPrefs(context).edit().apply {
             putBoolean(KEY_IS_AUTHORIZED, authorized)
             putString(KEY_CONNECTED_CLIENT_IP, clientIp)
+            putString(KEY_CONNECTED_DEVICE_NAME, connectedDeviceName)
+            putString(KEY_REST_TOKEN, rToken)
+            putString(KEY_WS_TOKEN, wToken)
             apply()
         }
-        Log.d(TAG, "Auth state saved: authorized=$authorized, clientIp=$clientIp")
+        Log.d(TAG, "Auth state saved: authorized=$authorized, clientIp=$clientIp, tokens set=${rToken != null}")
     }
 
 
-    fun setAuthorized(context: Context, authorized: Boolean, clientIp: String? = null) {
+    fun setAuthorized(context: Context, authorized: Boolean, clientIp: String? = null, devName: String? = null, rToken: String? = null, wToken: String? = null) {
         isAuthorized.set(authorized)
         authorizedState.value = authorized
         connectedClientIp = if (authorized) clientIp else null
+        connectedDeviceName = if (authorized) devName else null
         clientIpState.value = connectedClientIp
-        saveAuthState(context, authorized, connectedClientIp)
+        deviceNameState.value = connectedDeviceName
+        if (authorized) {
+            restToken = rToken
+            wsToken = wToken
+        } else {
+            restToken = null
+            wsToken = null
+        }
+        saveAuthState(context, authorized, connectedClientIp, restToken, wsToken)
+    }
+
+    fun unpair(context: Context) {
+        setAuthorized(context, false)
+        Log.i(TAG, "Device unpaired manually from app. Notifying and closing active sessions.")
+        
+        // Notify and close all active WebSocket sessions
+        val sessions = webSocketSessions.toList()
+        webSocketSessions.clear()
+        isClientConnectedState.value = false
+        
+        CoroutineScope(Dispatchers.IO).launch {
+            sessions.forEach { session ->
+                try {
+                    session.send(Frame.Text("{\"type\":\"UNPAIR\"}"))
+                    session.close(CloseReason(CloseReason.Codes.VIOLATED_POLICY, "Unpaired from mobile app"))
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error notifying/closing session on unpair", e)
+                }
+            }
+        }
     }
 
 
-    private fun loadAuthState(context: Context): Pair<Boolean, String?> {
+    private fun loadAuthState(context: Context): Map<String, Any?> {
         val prefs = getPrefs(context)
-        val authorized = prefs.getBoolean(KEY_IS_AUTHORIZED, false)
-        val clientIp = prefs.getString(KEY_CONNECTED_CLIENT_IP, null)
-        Log.d(TAG, "Auth state loaded: authorized=$authorized, clientIp=$clientIp")
-        return Pair(authorized, clientIp)
+        return mapOf(
+            "authorized" to prefs.getBoolean(KEY_IS_AUTHORIZED, false),
+            "clientIp" to prefs.getString(KEY_CONNECTED_CLIENT_IP, null),
+            "deviceName" to prefs.getString(KEY_CONNECTED_DEVICE_NAME, null),
+            "restToken" to prefs.getString(KEY_REST_TOKEN, null),
+            "wsToken" to prefs.getString(KEY_WS_TOKEN, null)
+        )
     }
 
 
@@ -163,12 +220,19 @@ object SmsServer {
         CoroutineScope(Dispatchers.IO).launch {
             try {
                 // Restore authorization from previous session
-                val (restoredAuth, restoredClientIp) = loadAuthState(context)
+                val authData = loadAuthState(context)
+                val restoredAuth = authData["authorized"] as Boolean
+                val restoredClientIp = authData["clientIp"] as? String
+                restToken = authData["restToken"] as? String
+                wsToken = authData["wsToken"] as? String
+                
                 isAuthorized.set(restoredAuth)
                 authorizedState.value = restoredAuth
                 connectedClientIp = restoredClientIp
+                connectedDeviceName = authData["deviceName"] as? String
+                deviceNameState.value = connectedDeviceName
                 clientIpState.value = restoredClientIp
-                Log.d(TAG, "Restored auth state: authorized=$restoredAuth, clientIp=$restoredClientIp")
+                Log.d(TAG, "Restored auth state: authorized=$restoredAuth, clientIp=$restoredClientIp, tokensRestored=${restToken != null}")
 
                 Log.d(TAG, "Starting Ktor server on 0.0.0.0:8080...")
 
@@ -196,16 +260,30 @@ object SmsServer {
                         }
                         post("/pair") {
                             val clientIp = call.request.local.remoteAddress
-                            Log.d(TAG, "Pairing request from $clientIp")
+                            val deviceName = call.request.queryParameters["deviceName"] ?: "Unknown PC"
+                            Log.d(TAG, "Pairing request from $clientIp ($deviceName)")
 
                             // Revoke previous authorization on new pairing attempt
                             isAuthorized.set(false)
+                            
+                            // Generate new tokens
+                            val newRestToken = java.util.UUID.randomUUID().toString()
+                            val newWsToken = java.util.UUID.randomUUID().toString()
 
-                            pairingRequests.emit(clientIp)
+                            pairingRequests.emit(PairingRequest(clientIp, deviceName))
+                            
+                            // We return the tokens in the response. They will be saved on PC
+                            // but only become valid once 'setAuthorized' is called on the phone.
                             call.respondText(
-                                "{\"status\":\"pending\"}",
+                                "{\"status\":\"pending\",\"restToken\":\"$newRestToken\",\"wsToken\":\"$newWsToken\"}",
                                 ContentType.Application.Json
                             )
+                            
+                             // Temporarily store them so they can be saved when user clicks "Allow"
+                            pendingRestToken = newRestToken
+                            pendingWsToken = newWsToken
+                            connectedClientIp = clientIp
+                            connectedDeviceName = deviceName
                         }
                         post("/unpair") {
                             Log.d(TAG, "Unpair request received")
@@ -217,7 +295,8 @@ object SmsServer {
                         }
 
                         get("/notifications") {
-                            if (!isAuthorized.get()) {
+                            val token = call.request.queryParameters["token"]
+                            if (!isAuthorized.get() || token != restToken) {
                                 call.respondText("{\"error\":\"Unauthorized\"}", ContentType.Application.Json, HttpStatusCode.Unauthorized)
                                 return@get
                             }
@@ -233,7 +312,8 @@ object SmsServer {
                         }
 
                         post("/notifications/clear") {
-                            if (!isAuthorized.get()) {
+                            val token = call.request.queryParameters["token"]
+                            if (!isAuthorized.get() || token != restToken) {
                                 call.respondText("{\"error\":\"Unauthorized\"}", ContentType.Application.Json, HttpStatusCode.Unauthorized)
                                 return@post
                             }
@@ -252,7 +332,8 @@ object SmsServer {
 
                         post("/answer_call") {
                             Log.d(TAG, "Answer call request")
-                            if (!isAuthorized.get()) {
+                            val token = call.request.queryParameters["token"]
+                            if (!isAuthorized.get() || token != restToken) {
                                 call.respondText("{\"error\":\"Unauthorized\"}", ContentType.Application.Json, HttpStatusCode.Unauthorized)
                                 return@post
                             }
@@ -273,7 +354,8 @@ object SmsServer {
                         }
                         post("/decline_call") {
                             Log.d(TAG, "Decline call request")
-                            if (!isAuthorized.get()) {
+                            val token = call.request.queryParameters["token"]
+                            if (!isAuthorized.get() || token != restToken) {
                                 call.respondText("{\"error\":\"Unauthorized\"}", ContentType.Application.Json, HttpStatusCode.Unauthorized)
                                 return@post
                             }
@@ -297,8 +379,9 @@ object SmsServer {
                             val clientIp = call.request.local.remoteAddress
                             Log.d(TAG, "WebSocket connection attempt from $clientIp")
                             
-                            if (!isAuthorized.get()) {
-                                Log.d(TAG, "WebSocket rejected: Unauthorized")
+                            val token = call.request.queryParameters["token"]
+                            if (!isAuthorized.get() || token != wsToken) {
+                                Log.d(TAG, "WebSocket rejected: Unauthorized or invalid token")
                                 close(CloseReason(CloseReason.Codes.VIOLATED_POLICY, "Unauthorized"))
                                 return@webSocket
                             }
@@ -369,7 +452,8 @@ object SmsServer {
                             )
                         }
                         get("/sms") {
-                            if (!isAuthorized.get()) {
+                            val token = call.request.queryParameters["token"]
+                            if (!isAuthorized.get() || token != restToken) {
                                 call.respondText(
                                     "{\"error\":\"Unauthorized\"}",
                                     ContentType.Application.Json,

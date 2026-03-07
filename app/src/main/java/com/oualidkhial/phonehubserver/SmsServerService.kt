@@ -22,6 +22,8 @@ class SmsServerService : Service() {
         const val ACTION_DISCONNECT = "ACTION_DISCONNECT"
     }
 
+    private var sftpServer: SftpServer? = null
+
     // Broadcast receiver for loading SMS
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -38,7 +40,21 @@ class SmsServerService : Service() {
         Log.d("SmsServerService", "onCreate")
 
         // Start Ktor server
-        SmsServer.start(this)
+        try {
+            Log.d("SmsServerService", "Requesting Ktor server start...")
+            SmsServer.start(this)
+        } catch (e: Exception) {
+            Log.e("SmsServerService", "Failed to start Ktor server", e)
+        }
+
+        // Start SFTP server
+        try {
+            Log.d("SmsServerService", "Initializing SFTP server...")
+            sftpServer = SftpServer(this)
+            sftpServer?.start()
+        } catch (e: Exception) {
+            Log.e("SmsServerService", "Failed to start SFTP server", e)
+        }
 
         // Register broadcast receiver
         val filter = IntentFilter("LOAD_SMS_ACTION")
@@ -59,6 +75,7 @@ class SmsServerService : Service() {
             Log.d("SmsServerService", "Disconnect requested")
 
             SmsServer.stop()
+            sftpServer?.stop()
 
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
@@ -142,6 +159,7 @@ class SmsServerService : Service() {
         Log.d("SmsServerService", "onDestroy")
 
         SmsServer.stop()
+        sftpServer?.stop()
 
         try {
             unregisterReceiver(receiver)

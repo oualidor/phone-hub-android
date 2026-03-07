@@ -1,39 +1,43 @@
 # Phone HUB Server
 
-## Connect your android phone to linux gnome easyly
-Designed to work in tandem with the **Phone HUB GNOME Extension**, this app turns your phone into a background server providing a secure local API for your desktop.
+## Connect your Android phone to Linux GNOME seamlessly
+Designed to work in tandem with the **Phone HUB GNOME Extension**, this app turns your phone into a secure hub for your desktop, allowing for seamless integration without cloud dependencies.
 
 ## 🚀 Features
 
-*   **Call Management:** See who's calling with contact name resolution and answer or decline calls directly from your GNOME shell.
-*   **Notification Mirroring:** Forward all your phone notifications to your desktop (requires Notification Access).
-*   **Secure Pairing:** Simple and secure pairing process ensures only authorized devices can access your data.
-*   **Mirror your phone and control it from PC (abd reauired)
-*   **Use your phone as webcam (abd reauired)
+*   **QR Code Pairing:** Effortless, secure pairing by scanning a QR code on your desktop. No manual IP entry required.
+*   **SFTP File Mounting:** Mount your phone's entire filesystem (`/sdcard`) directly to your PC using SSHFS. Browse your phone's files in Nautilus like a local drive.
+*   **Call Management:** Real-time call notifications with contact name resolution. Answer or decline calls directly from your GNOME shell.
+*   **Notification Sync:** Mirror all system notifications from your phone to your desktop via local WebSockets.
+*   **Remote Control & Webcam:** Mirror your screen or use your phone as a high-quality webcam (requires ADB for these specific native features).
 
-## 🛠️ Installation & Setup
+## 🛠️ How it works (Transparency)
 
-1.  **Install the App:** Clone this repository and build the project in Android Studio, or install the APK on your Android device.
-2.  **Install the Desktop Extension:** Download and install the [Phone HUB GNOME Extension](https://github.com/oualidor/gnome-phone-hub) (link to be updated).
-3.  **Grant Permissions:** Open the app and grant the necessary permissions:
-    *   **SMS:** To read and sync messages.
-    *   **Phone/Call Logs:** To monitor incoming calls.
-    *   **Contacts:** To display names instead of just numbers.
-    *   **Notification Access:** (Special permission) To mirror system notifications.
-4.  **Pairing:**
-    *   Ensure both your phone and PC are on the same Wi-Fi network.
-    *   In the GNOME extension, select **"Pair New Device"**.
-    *   An authorization dialog will appear on your phone. Tap **"Allow"** to establish the secure connection.
+Phone HUB is built for users who value privacy and local control. It uses a **Local-First Architecture**:
 
+1.  **Transport:** All communication happens over your local Wi-Fi. 
+    - **REST API (Ktor):** Handles pairing requests and simple status checks.
+    - **WebSockets:** Provides real-time, low-latency events for notifications and calls.
+    - **SFTP (Apache SSHD):** Runs a secure SFTP server on port `2222` for file access.
+2.  **Security:** 
+    - **Token-Based Auth:** During pairing, the phone and PC exchange unique random tokens. Every subsequent request must include this token.
+    - **Manual Authorization:** You must explicitly tap "Allow" on your phone for every new pairing request.
+    - **Internal Home:** The SFTP server is isolated and uses a virtualized file system rooted in your device's storage.
 
+## ⚙️ Installation & Setup
+
+1.  **Install the App:** Clone this repository and build it in Android Studio, or install the provided APK.
+2.  **Install the Extension:** Install the [Phone HUB GNOME Extension](https://github.com/oualidor/gnome-phone-hub) on your PC.
+3.  **Grant Permissions:** Open the app and grant:
+    - **File Access:** Required for SFTP mounting.
+    - **SMS/Calls/Contacts:** For communication syncing.
+    - **Notification Access:** For system-wide mirroring.
+    - **Appear on Top:** Allows the pairing dialog to show even if the app is in the background.
+4.  **Pairing:** Select **"Pair New Device"** in GNOME, scan the QR code with the app, and tap **"Allow"** on your phone.
 
 ## 🔒 Privacy & Security
 
-Phone HUB Server operates strictly over your **local network**. No data is ever sent to external servers or the cloud. The pairing system ensures that only the PC you explicitly authorize can communicate with the phone's API.
-
-## 🤝 Contributing
-
-Contributions are welcome! If you have ideas for new features or find any bugs, please open an issue or submit a pull request.
+Phone HUB operates strictly over your **local network**. No data is ever sent to external servers. Your pairing tokens are stored locally on your device and in your GNOME settings.
 
 ## 📄 License
 

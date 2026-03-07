@@ -5,6 +5,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
+import android.os.Environment
 import androidx.core.content.ContextCompat
 
 import android.os.Bundle
@@ -46,6 +47,9 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.text.font.FontWeight
 import com.oualidkhial.phonehubserver.ui.theme.PhoneHUBServerTheme
@@ -58,15 +62,15 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             PhoneHUBServerTheme {
-                val context = androidx.compose.ui.platform.LocalContext.current
-                var permissionStates by remember { mutableStateOf(getPermissionStates(context)) }
+                val localContext = androidx.compose.ui.platform.LocalContext.current
+                var permissionStates by remember { mutableStateOf(getPermissionStates(localContext)) }
 
                 // Refresh permissions when returning to the app
                 val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
                 androidx.compose.runtime.DisposableEffect(lifecycleOwner) {
                     val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
                         if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
-                            permissionStates = getPermissionStates(context)
+                            permissionStates = getPermissionStates(localContext)
                         }
                     }
                     lifecycleOwner.lifecycle.addObserver(observer)
@@ -86,32 +90,32 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
-                var showPairingDialog by remember { mutableStateOf(false) }
-                var currentPairingIp by remember { mutableStateOf("") }
+                val pairingRequest by SmsServer.pairingRequests.collectAsState()
 
-                LaunchedEffect(Unit) {
-                    SmsServer.pairingRequests.collect { ip ->
-                        currentPairingIp = ip
-                        showPairingDialog = true
-                    }
-                }
-
-                if (showPairingDialog) {
+                if (pairingRequest != null) {
+                    val info = pairingRequest!!
                     AlertDialog(
-                        onDismissRequest = { showPairingDialog = false },
+                        onDismissRequest = { SmsServer.pairingRequests.value = null },
                         title = { Text("Pairing Request") },
-                        text = { Text("Allow connection from $currentPairingIp?") },
+                        text = { Text("Allow connection from ${info.deviceName} (${info.ip})?") },
                         confirmButton = {
                             TextButton(onClick = {
-                                SmsServer.setAuthorized(this@MainActivity, true, currentPairingIp)
-                                showPairingDialog = false
+                                SmsServer.setAuthorized(
+                                    this@MainActivity, 
+                                    true, 
+                                    info.ip,
+                                    info.deviceName,
+                                    SmsServer.getPendingRestToken(),
+                                    SmsServer.getPendingWsToken()
+                                )
+                                SmsServer.pairingRequests.value = null
                             }) {
                                 Text("Allow")
                             }
                         },
                         dismissButton = {
                             TextButton(onClick = {
-                                showPairingDialog = false
+                                SmsServer.pairingRequests.value = null
                             }) {
                                 Text("Deny")
                             }
@@ -126,7 +130,8 @@ class MainActivity : ComponentActivity() {
                         Manifest.permission.READ_PHONE_STATE,
                         Manifest.permission.READ_CALL_LOG,
                         Manifest.permission.ANSWER_PHONE_CALLS,
-                        Manifest.permission.READ_CONTACTS
+                        Manifest.permission.READ_CONTACTS,
+                        Manifest.permission.CAMERA
                     )
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                         permissionsToRequest.add(Manifest.permission.POST_NOTIFICATIONS)
@@ -163,7 +168,9 @@ fun SmsListScreen(
     val ipAddress = SmsServer.getLocalIpAddress()
     val isAuthorized by SmsServer.authorizedState.collectAsState()
     val connectedClientIp by SmsServer.clientIpState.collectAsState()
+    val connectedDeviceName by SmsServer.deviceNameState.collectAsState()
     val isClientConnected by SmsServer.isClientConnectedState.collectAsState()
+    val localContext = androidx.compose.ui.platform.LocalContext.current
 
     Column(
         modifier = modifier
@@ -237,7 +244,7 @@ fun SmsListScreen(
                                         color = Color(0xFF2E7D32)
                                     )
                                     Text(
-                                        text = connectedClientIp ?: "Unknown PC",
+                                        text = connectedDeviceName ?: connectedClientIp ?: "Unknown PC",
                                         style = MaterialTheme.typography.bodySmall,
                                         color = Color(0xFF388E3C)
                                     )
@@ -268,13 +275,27 @@ fun SmsListScreen(
                                         color = MaterialTheme.colorScheme.onSecondaryContainer
                                     )
                                     Text(
-                                        text = connectedClientIp ?: "Unknown PC",
+                                        text = connectedDeviceName ?: connectedClientIp ?: "Unknown PC",
                                         style = MaterialTheme.typography.bodySmall,
                                         color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.8f)
                                     )
                                 }
                             }
                         }
+                    }
+                    
+                    Spacer(modifier = Modifier.height(16.dp))
+                    OutlinedButton(
+                        onClick = { SmsServer.unpair(localContext) },
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error),
+                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.error),
+                        shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Text(
+                            text = "Unpair Device",
+                            style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold)
+                        )
                     }
                 } else {
                     Card(
@@ -296,10 +317,19 @@ fun SmsListScreen(
                                 Text(
                                     text = "1. Install the Phone HUB extension on your GNOME desktop.\n" +
                                            "2. Open the extension and select 'Pair New Device'.\n" +
-                                           "3. Accept the pairing request on this phone.",
+                                           "3. Tap the button below and scan the QR code on your PC.",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onErrorContainer.copy(alpha = 0.9f)
                                 )
+                                Spacer(modifier = Modifier.height(12.dp))
+                                Button(
+                                    onClick = {
+                                        localContext.startActivity(Intent(localContext, QrScannerActivity::class.java))
+                                    },
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Text("Scan QR to Pair")
+                                }
                             }
                         }
                     }
@@ -310,7 +340,6 @@ fun SmsListScreen(
         Spacer(modifier = Modifier.height(16.dp))
 
         // --- PERMISSIONS SECTION ---
-        val context = androidx.compose.ui.platform.LocalContext.current
         
         // 1. Notification Access (Special)
         if (!permissionStates.notificationsEnabled) {
@@ -319,7 +348,7 @@ fun SmsListScreen(
                 description = "To see phone notifications on your PC, you must enable Notification Access for this app.",
                 buttonText = "Enable Notification Access",
                 onClick = {
-                    context.startActivity(Intent("android.settings.ACTION_NOTIFICATION_LISTENER_SETTINGS"))
+                    localContext.startActivity(Intent("android.settings.ACTION_NOTIFICATION_LISTENER_SETTINGS"))
                 }
             )
         }
@@ -331,8 +360,8 @@ fun SmsListScreen(
                 description = "To see and respond to SMS on your PC, please grant SMS permissions.",
                 buttonText = "Grant SMS Permissions",
                 onClick = {
-                    context.startActivity(Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
-                        data = Uri.fromParts("package", context.packageName, null)
+                    localContext.startActivity(Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                        data = Uri.fromParts("package", localContext.packageName, null)
                     })
                 }
             )
@@ -345,8 +374,8 @@ fun SmsListScreen(
                 description = "To see incoming calls and answer them from your PC, please grant Phone and Call Log permissions.",
                 buttonText = "Grant Call Permissions",
                 onClick = {
-                    context.startActivity(Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
-                        data = Uri.fromParts("package", context.packageName, null)
+                    localContext.startActivity(Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                        data = Uri.fromParts("package", localContext.packageName, null)
                     })
                 }
             )
@@ -359,9 +388,51 @@ fun SmsListScreen(
                 description = "To see contact names instead of just phone numbers, please grant Contacts permission.",
                 buttonText = "Grant Contacts Permission",
                 onClick = {
-                    context.startActivity(Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
-                        data = Uri.fromParts("package", context.packageName, null)
+                    localContext.startActivity(Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                        data = Uri.fromParts("package", localContext.packageName, null)
                     })
+                }
+            )
+        }
+
+
+
+        // 6. Camera Permission (for QR)
+        if (!permissionStates.cameraEnabled) {
+            PermissionCard(
+                title = "Scanner Access Required",
+                description = "To scan the pairing QR code, please grant Camera permission.",
+                buttonText = "Grant Camera Permission",
+                onClick = {
+                    localContext.startActivity(Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                        data = Uri.fromParts("package", localContext.packageName, null)
+                    })
+                }
+            )
+        }
+
+        // 7. Storage Permission (for SFTP)
+        if (!permissionStates.storageEnabled) {
+            PermissionCard(
+                title = "File Access Required",
+                description = "To mount your phone's files on your PC, please enable file access.",
+                buttonText = "Enable File Access",
+                onClick = {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                        try {
+                            val intent = Intent(android.provider.Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
+                                data = Uri.parse("package:${localContext.packageName}")
+                            }
+                            localContext.startActivity(intent)
+                        } catch (e: Exception) {
+                            val intent = Intent(android.provider.Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
+                            localContext.startActivity(intent)
+                        }
+                    } else {
+                        localContext.startActivity(Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                            data = Uri.fromParts("package", localContext.packageName, null)
+                        })
+                    }
                 }
             )
         }
@@ -374,7 +445,9 @@ data class PermissionStates(
     val notificationsEnabled: Boolean,
     val smsEnabled: Boolean,
     val callsEnabled: Boolean,
-    val contactsEnabled: Boolean
+    val contactsEnabled: Boolean,
+    val cameraEnabled: Boolean,
+    val storageEnabled: Boolean
 )
 
 fun getPermissionStates(context: android.content.Context): PermissionStates {
@@ -384,7 +457,13 @@ fun getPermissionStates(context: android.content.Context): PermissionStates {
         notificationsEnabled = android.provider.Settings.Secure.getString(context.contentResolver, "enabled_notification_listeners")?.contains(context.packageName) == true,
         smsEnabled = check(Manifest.permission.READ_SMS) && check(Manifest.permission.RECEIVE_SMS),
         callsEnabled = check(Manifest.permission.READ_PHONE_STATE) && check(Manifest.permission.READ_CALL_LOG) && check(Manifest.permission.ANSWER_PHONE_CALLS),
-        contactsEnabled = check(Manifest.permission.READ_CONTACTS)
+        contactsEnabled = check(Manifest.permission.READ_CONTACTS),
+        cameraEnabled = check(Manifest.permission.CAMERA),
+        storageEnabled = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            Environment.isExternalStorageManager()
+        } else {
+            check(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+        }
     )
 }
 
