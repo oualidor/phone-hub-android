@@ -32,4 +32,37 @@ object ContactHelper {
 
         return null
     }
+
+    fun getAllContacts(context: Context): List<PhoneContact> {
+        val contactsList = mutableListOf<PhoneContact>()
+        try {
+            val uri = ContactsContract.CommonDataKinds.Phone.CONTENT_URI
+            val projection = arrayOf(
+                ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
+                ContactsContract.CommonDataKinds.Phone.NUMBER
+            )
+            val sortOrder = "${ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME} ASC"
+
+            context.contentResolver.query(uri, projection, null, null, sortOrder)?.use { cursor ->
+                val nameIndex = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME)
+                val numberIndex = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.NUMBER)
+
+                if (nameIndex != -1 && numberIndex != -1) {
+                    while (cursor.moveToNext()) {
+                        val name = cursor.getString(nameIndex)
+                        val number = cursor.getString(numberIndex)
+                        if (!name.isNullOrEmpty() && !number.isNullOrEmpty()) {
+                            contactsList.add(PhoneContact(name, number))
+                        }
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error fetching all contacts", e)
+        }
+        // Deduplicate by name and number to avoid duplicates if a contact has multiple entries
+        return contactsList.distinctBy { "${it.name}|${it.number}" }
+    }
 }
+
+data class PhoneContact(val name: String, val number: String)

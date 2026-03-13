@@ -20,6 +20,7 @@ class SmsServerService : Service() {
     companion object {
         const val CHANNEL_ID = "sms_server_channel"
         const val ACTION_DISCONNECT = "ACTION_DISCONNECT"
+        const val ACTION_UPDATE_SERVICES = "ACTION_UPDATE_SERVICES"
     }
 
     private var sftpServer: SftpServer? = null
@@ -38,22 +39,24 @@ class SmsServerService : Service() {
     override fun onCreate() {
         super.onCreate()
         Log.d("SmsServerService", "onCreate")
+        SmsServer.isServiceRunningState.value = true
 
-        // Start Ktor server
+        // Always start Phone HUB Server when the service is active
         try {
-            Log.d("SmsServerService", "Requesting Ktor server start...")
+            Log.d("SmsServerService", "Starting Phone HUB Server...")
             SmsServer.start(this)
         } catch (e: Exception) {
             Log.e("SmsServerService", "Failed to start Ktor server", e)
         }
 
-        // Start SFTP server
-        try {
-            Log.d("SmsServerService", "Initializing SFTP server...")
-            sftpServer = SftpServer(this)
-            sftpServer?.start()
-        } catch (e: Exception) {
-            Log.e("SmsServerService", "Failed to start SFTP server", e)
+        if (SmsServer.getSftpServerEnabled(this)) {
+            try {
+                Log.d("SmsServerService", "Starting SFTP server...")
+                sftpServer = SftpServer(this)
+                sftpServer?.start()
+            } catch (e: Exception) {
+                Log.e("SmsServerService", "Failed to start SFTP server", e)
+            }
         }
 
         // Register broadcast receiver
@@ -81,6 +84,19 @@ class SmsServerService : Service() {
             stopSelf()
 
             return START_NOT_STICKY
+        }
+
+        // Handle Service State Updates
+        if (intent?.action == ACTION_UPDATE_SERVICES) {
+            Log.d("SmsServerService", "Updating service states...")
+            
+            // SFTP Server (Phone HUB server is already managed by the service lifecycle)
+            if (SmsServer.getSftpServerEnabled(this)) {
+                if (sftpServer == null) sftpServer = SftpServer(this)
+                sftpServer?.start()
+            } else {
+                sftpServer?.stop()
+            }
         }
 
         val notification = createNotification()
@@ -121,6 +137,10 @@ class SmsServerService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
+        val sftpRunning = SmsServer.getSftpServerEnabled(this)
+        
+        val statusText = if (sftpRunning) "Phone HUB & SFTP Running" else "Phone HUB Running"
+
         val connectionText =
             if (SmsServer.authorizedState.value)
                 "Connected to ${SmsServer.clientIpState.value}"
@@ -128,7 +148,7 @@ class SmsServerService : Service() {
                 "Waiting for connection • Port 8080"
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("Phone HUB Server Running")
+            .setContentTitle(statusText)
             .setContentText(connectionText)
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .setContentIntent(openAppPendingIntent)
@@ -158,6 +178,7 @@ class SmsServerService : Service() {
         super.onDestroy()
         Log.d("SmsServerService", "onDestroy")
 
+        SmsServer.isServiceRunningState.value = false
         SmsServer.stop()
         sftpServer?.stop()
 

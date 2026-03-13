@@ -23,6 +23,8 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -52,6 +54,7 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.text.font.FontWeight
+import android.app.Activity
 import com.oualidkhial.phonehubserver.ui.theme.PhoneHUBServerTheme
 
 
@@ -71,6 +74,9 @@ class MainActivity : ComponentActivity() {
                     val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
                         if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
                             permissionStates = getPermissionStates(localContext)
+                            if (SmsServer.getServiceEnabled(localContext) && !SmsServer.isServiceRunningState.value) {
+                                startSmsServerService()
+                            }
                         }
                     }
                     lifecycleOwner.lifecycle.addObserver(observer)
@@ -86,7 +92,9 @@ class MainActivity : ComponentActivity() {
                         sendBroadcast(Intent("LOAD_SMS_ACTION"))
                     }
                     if (permissions[Manifest.permission.POST_NOTIFICATIONS] == true || Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
-                        startSmsServerService()
+                        if (SmsServer.getServiceEnabled(localContext)) {
+                            startSmsServerService()
+                        }
                     }
                 }
 
@@ -131,8 +139,12 @@ class MainActivity : ComponentActivity() {
                         Manifest.permission.READ_CALL_LOG,
                         Manifest.permission.ANSWER_PHONE_CALLS,
                         Manifest.permission.READ_CONTACTS,
+                        Manifest.permission.CALL_PHONE,
                         Manifest.permission.CAMERA
                     )
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                        permissionsToRequest.add(Manifest.permission.BLUETOOTH_CONNECT)
+                    }
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                         permissionsToRequest.add(Manifest.permission.POST_NOTIFICATIONS)
                     }
@@ -164,13 +176,17 @@ fun SmsListScreen(
     modifier: Modifier = Modifier,
     permissionStates: PermissionStates
 ) {
+    val localContext = androidx.compose.ui.platform.LocalContext.current
     val messages by SmsRepository.messages.collectAsState()
-    val ipAddress = SmsServer.getLocalIpAddress()
+    val ipAddress = SmsServer.getLocalIpAddress(localContext)
     val isAuthorized by SmsServer.authorizedState.collectAsState()
     val connectedClientIp by SmsServer.clientIpState.collectAsState()
     val connectedDeviceName by SmsServer.deviceNameState.collectAsState()
     val isClientConnected by SmsServer.isClientConnectedState.collectAsState()
-    val localContext = androidx.compose.ui.platform.LocalContext.current
+    
+
+
+    val isServiceRunning by SmsServer.isServiceRunningState.collectAsState()
 
     Column(
         modifier = modifier
@@ -188,7 +204,8 @@ fun SmsListScreen(
             ),
             elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
             shape = RoundedCornerShape(16.dp)
-        ) {
+        )
+        {
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -196,27 +213,13 @@ fun SmsListScreen(
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
                 Text(
-                    text = "Phone HUB Server",
+                    text = "Phone Hub",
                     style = MaterialTheme.typography.headlineSmall.copy(fontWeight = FontWeight.Bold),
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
                 
                 Spacer(modifier = Modifier.height(8.dp))
                 
-                Card(
-                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
-                    shape = RoundedCornerShape(8.dp)
-                ) {
-                    Text(
-                        text = "IP Address: $ipAddress:8080",
-                        style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.SemiBold),
-                        color = MaterialTheme.colorScheme.onPrimaryContainer,
-                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
-                    )
-                }
-
-                Spacer(modifier = Modifier.height(16.dp))
-
                 // Connection Status Area
                 if (isAuthorized) {
                     if (isClientConnected) {
@@ -238,13 +241,14 @@ fun SmsListScreen(
                                         .background(Color(0xFF4CAF50), shape = androidx.compose.foundation.shape.CircleShape)
                                 )
                                 Column {
+                                    val DeviceName = connectedDeviceName ?: connectedClientIp ?: "Unknown PC";
                                     Text(
-                                        text = "Connected securely to PC",
+                                        text = "Connected securely to $DeviceName",
                                         style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
                                         color = Color(0xFF2E7D32)
                                     )
                                     Text(
-                                        text = connectedDeviceName ?: connectedClientIp ?: "Unknown PC",
+                                        text = "",
                                         style = MaterialTheme.typography.bodySmall,
                                         color = Color(0xFF388E3C)
                                     )
@@ -284,7 +288,8 @@ fun SmsListScreen(
                         }
                     }
                     
-                    Spacer(modifier = Modifier.height(16.dp))
+                    Spacer(modifier = Modifier.height(8.dp))
+
                     OutlinedButton(
                         onClick = { SmsServer.unpair(localContext) },
                         modifier = Modifier.fillMaxWidth(),
@@ -337,7 +342,44 @@ fun SmsListScreen(
             }
         }
 
+        // --- SERVICE MANAGEMENT SECTION ---
+        Button(
+            onClick = {
+                val newEnabledState = !isServiceRunning
+                SmsServer.setServiceEnabled(localContext, newEnabledState)
+                SmsServer.setSftpServerEnabled(localContext, newEnabledState)
+
+                val intent = Intent(localContext, SmsServerService::class.java)
+                if (newEnabledState) {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        localContext.startForegroundService(intent)
+                    } else {
+                        localContext.startService(intent)
+                    }
+                } else {
+                    intent.action = SmsServerService.ACTION_DISCONNECT
+                    localContext.startService(intent)
+                }
+            },
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 8.dp)
+                .height(56.dp),
+            shape = RoundedCornerShape(12.dp),
+            colors = ButtonDefaults.buttonColors(
+                containerColor = if (isServiceRunning) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
+                contentColor = if (isServiceRunning) MaterialTheme.colorScheme.onError else MaterialTheme.colorScheme.onPrimary
+            )
+        ) {
+            Text(
+                text = if (isServiceRunning) "Stop Phone Hub Service" else "Start Phone Hub Service",
+                style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold)
+            )
+        }
+
         Spacer(modifier = Modifier.height(16.dp))
+        HorizontalDivider(modifier = Modifier.padding(horizontal = 16.dp), thickness = 0.5.dp, color = MaterialTheme.colorScheme.outlineVariant)
+        Spacer(modifier = Modifier.height(8.dp))
 
         // --- PERMISSIONS SECTION ---
         
@@ -382,11 +424,11 @@ fun SmsListScreen(
         }
 
         // 4. Contact Permissions
-        if (!permissionStates.contactsEnabled) {
+        if (!permissionStates.contactsEnabled || ContextCompat.checkSelfPermission(localContext, Manifest.permission.CALL_PHONE) != PackageManager.PERMISSION_GRANTED) {
             PermissionCard(
-                title = "Contact Names Required",
-                description = "To see contact names instead of just phone numbers, please grant Contacts permission.",
-                buttonText = "Grant Contacts Permission",
+                title = "Contacts & Calling Required",
+                description = "To see contact names and start calls from your PC, please grant Contacts and Phone permissions.",
+                buttonText = "Grant Permissions",
                 onClick = {
                     localContext.startActivity(Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
                         data = Uri.fromParts("package", localContext.packageName, null)
@@ -411,7 +453,7 @@ fun SmsListScreen(
             )
         }
 
-        // 7. Storage Permission (for SFTP)
+        // 8. Storage Permission (for SFTP)
         if (!permissionStates.storageEnabled) {
             PermissionCard(
                 title = "File Access Required",
@@ -436,10 +478,11 @@ fun SmsListScreen(
                 }
             )
         }
+        }
 
         Spacer(modifier = Modifier.height(16.dp))
     }
-}
+
 
 data class PermissionStates(
     val notificationsEnabled: Boolean,
@@ -501,44 +544,3 @@ fun PermissionCard(
         }
     }
 }
-
-@Composable
-fun SmsItem(message: SmsMessage) {
-    ElevatedCard(
-        modifier = Modifier.fillMaxWidth(),
-        elevation = CardDefaults.elevatedCardElevation(defaultElevation = 1.dp),
-        colors = CardDefaults.elevatedCardColors(
-            containerColor = MaterialTheme.colorScheme.surface
-        ),
-        shape = RoundedCornerShape(12.dp)
-    ) {
-        Column(modifier = Modifier.padding(16.dp)) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    text = message.sender,
-                    style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
-                    color = MaterialTheme.colorScheme.onSurface
-                )
-                Text(
-                    text = java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault())
-                        .format(java.util.Date(message.timestamp)),
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
-            Spacer(modifier = Modifier.height(6.dp))
-            Text(
-                text = message.body,
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.85f),
-                maxLines = 3,
-                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
-            )
-        }
-    }
-}
-

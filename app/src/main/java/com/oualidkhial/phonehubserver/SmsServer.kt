@@ -1,8 +1,10 @@
 package com.oualidkhial.phonehubserver
-
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
-import android.util.Log
+import android.net.Uri
 import io.ktor.server.application.call
 import io.ktor.server.cio.CIO
 import io.ktor.server.engine.ApplicationEngine
@@ -13,6 +15,7 @@ import io.ktor.server.routing.post
 import io.ktor.server.routing.routing
 import io.ktor.server.websocket.*
 import io.ktor.websocket.*
+import io.ktor.websocket.Frame
 import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
 import kotlinx.coroutines.CoroutineScope
@@ -28,16 +31,27 @@ import android.telecom.TelecomManager
 import androidx.core.content.ContextCompat
 import android.Manifest
 import android.content.pm.PackageManager
+import androidx.core.app.NotificationCompat
 import android.content.SharedPreferences
 import io.ktor.server.application.install
 import io.ktor.server.request.receiveText
+import android.media.Ringtone
+import android.media.RingtoneManager
+import android.media.AudioAttributes
+import android.util.Log
+import android.os.BatteryManager
+import kotlinx.coroutines.Job
+import org.json.JSONObject
+import java.util.Locale
 
 private const val PREFS_NAME = "PhoneHubPrefs"
 private const val KEY_IS_AUTHORIZED = "isAuthorized"
 private const val KEY_CONNECTED_CLIENT_IP = "connectedClientIp"
 private const val KEY_REST_TOKEN = "restToken"
 private const val KEY_WS_TOKEN = "wsToken"
-private const val KEY_CONNECTED_DEVICE_NAME = "connectedDeviceName"
+private const val KEY_CONNECTED_DEVICE_NAME = "deviceName"
+private const val KEY_SERVICE_ENABLED = "serviceEnabled"
+private const val KEY_SFTP_SERVER_ENABLED = "sftpServerEnabled"
 
 data class PairingRequest(val ip: String, val deviceName: String)
 
@@ -45,6 +59,24 @@ data class PairingRequest(val ip: String, val deviceName: String)
 object SmsServer {
     private var server: ApplicationEngine? = null
     private const val TAG = "SmsServer"
+
+    fun getLocalIpAddress(context: Context): String {
+        try {
+            val wifiManager = context.getApplicationContext().getSystemService(Context.WIFI_SERVICE) as android.net.wifi.WifiManager
+            val wifiInfo = wifiManager.connectionInfo
+            val ipAddress = wifiInfo.ipAddress
+            return String.format(
+                Locale.US,
+                "%d.%d.%d.%d",
+                ipAddress and 0xff,
+                ipAddress shr 8 and 0xff,
+                ipAddress shr 16 and 0xff,
+                ipAddress shr 24 and 0xff
+            )
+        } catch (e: Exception) {
+            return "127.0.0.1"
+        }
+    }
 
     val isAuthorized = AtomicBoolean(false)
     val authorizedState = kotlinx.coroutines.flow.MutableStateFlow(false)
@@ -54,12 +86,36 @@ object SmsServer {
     val deviceNameState = kotlinx.coroutines.flow.MutableStateFlow<String?>(null)
     val isClientConnectedState = kotlinx.coroutines.flow.MutableStateFlow(false)
     val pairingRequests = kotlinx.coroutines.flow.MutableStateFlow<PairingRequest?>(null)
+    private var activeRingtone: Ringtone? = null
+    
+    val serviceEnabledState = kotlinx.coroutines.flow.MutableStateFlow(true)
+    val sftpServerEnabledState = kotlinx.coroutines.flow.MutableStateFlow(true)
+
+    val isServiceRunningState = kotlinx.coroutines.flow.MutableStateFlow(false)
+    val isSmsServerActualRunningState = kotlinx.coroutines.flow.MutableStateFlow(false)
+    val isSftpServerActualRunningState = kotlinx.coroutines.flow.MutableStateFlow(false)
     
     var restToken: String? = null
     var wsToken: String? = null
 
     private var pendingRestToken: String? = null
     private var pendingWsToken: String? = null
+
+    private var statusMonitorJob: Job? = null
+    private var lastBroadcastedStatus: String? = null
+
+    fun getServiceEnabled(context: Context) = getPrefs(context).getBoolean(KEY_SERVICE_ENABLED, true)
+    fun getSftpServerEnabled(context: Context) = getPrefs(context).getBoolean(KEY_SFTP_SERVER_ENABLED, true)
+
+    fun setServiceEnabled(context: Context, enabled: Boolean) {
+        getPrefs(context).edit().putBoolean(KEY_SERVICE_ENABLED, enabled).apply()
+        serviceEnabledState.value = enabled
+    }
+
+    fun setSftpServerEnabled(context: Context, enabled: Boolean) {
+        getPrefs(context).edit().putBoolean(KEY_SFTP_SERVER_ENABLED, enabled).apply()
+        sftpServerEnabledState.value = enabled
+    }
 
     fun getPendingRestToken() = pendingRestToken
     fun getPendingWsToken() = pendingWsToken
@@ -68,7 +124,7 @@ object SmsServer {
         return restToken ?: getPrefs(context).getString(KEY_REST_TOKEN, null)
     }
 
-    // WebSocket connections
+    // WebSocket connections (control channel)
     private val webSocketSessions = java.util.Collections.synchronizedList(mutableListOf<DefaultWebSocketServerSession>())
 
 
@@ -79,6 +135,14 @@ object SmsServer {
             broadcastCallStatus()
         }
     var callerNumber = ""
+        set(value) {
+            val changed = field != value
+            field = value
+            if (changed) {
+                broadcastCallStatus()
+            }
+        }
+
 
     // Notifications state
     private val activeNotifications = java.util.concurrent.ConcurrentHashMap<String, PhoneNotification>()
@@ -99,7 +163,11 @@ object SmsServer {
 
     private fun broadcastCallStatus() {
         Log.d(TAG, "Broadcasting callStatus=$callStatus, len=${webSocketSessions.size}")
-        val payload = "{\"type\":\"CALL_STATUS\",\"status\":\"$callStatus\",\"number\":\"$callerNumber\"}"
+        val payload = JSONObject().apply {
+            put("type", "CALL_STATUS")
+            put("status", callStatus)
+            put("number", callerNumber)
+        }.toString()
         webSocketSessions.toList().forEach { session ->
             CoroutineScope(Dispatchers.IO).launch {
                 try {
@@ -114,7 +182,8 @@ object SmsServer {
     private fun broadcastNotification(notif: PhoneNotification) {
         val safeTitle = notif.title.replace("\"", "\\\"").replace("\n", "\\n")
         val safeText = notif.text.replace("\"", "\\\"").replace("\n", "\\n")
-        val payload = "{\"type\":\"NOTIFICATION\",\"id\":\"${notif.id}\",\"packageName\":\"${notif.packageName}\",\"title\":\"$safeTitle\",\"text\":\"$safeText\"}"
+        val payload = "{\"type\":\"NOTIFICATION\",\"id\":\"${notif.id}\",\"packageName\":\"${notif.packageName}\",\"title\":\"$safeTitle\",\"text\":\"$safeText\",\"category\":\"${notif.category ?: ""}\"}"
+
         webSocketSessions.toList().forEach { session ->
             CoroutineScope(Dispatchers.IO).launch {
                 try { session.send(Frame.Text(payload)) } catch (e: Exception) { }
@@ -129,6 +198,91 @@ object SmsServer {
                 try { session.send(Frame.Text(payload)) } catch (e: Exception) { }
             }
         }
+    }
+
+    private fun startStatusMonitor(context: Context) {
+        if (statusMonitorJob?.isActive == true) return
+
+        statusMonitorJob = CoroutineScope(Dispatchers.IO).launch {
+            Log.d(TAG, "Started DeviceStatusMonitor")
+            while (isActive) {
+                if (webSocketSessions.isEmpty() || !isAuthorized.get()) {
+                    delay(3000)
+                    continue
+                }
+
+                try {
+                    val bm = context.getSystemService(Context.BATTERY_SERVICE) as BatteryManager
+                    val batteryLevel = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
+
+                    val adapter = android.bluetooth.BluetoothAdapter.getDefaultAdapter()
+                    val bluetoothStatus = if (adapter?.isEnabled == true) "on" else "off"
+
+                    val telephonyManager = context.getSystemService(Context.TELEPHONY_SERVICE) as android.telephony.TelephonyManager
+                    
+                    var dataStatus = "off"
+                    var operator = "Unknown"
+                    var networkType = "Unknown"
+                    
+                    if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_PHONE_STATE) == PackageManager.PERMISSION_GRANTED) {
+                        dataStatus = if (telephonyManager.isDataEnabled) "on" else "off"
+                        operator = telephonyManager.networkOperatorName ?: "Unknown"
+                        
+                        val typeInt = try { telephonyManager.dataNetworkType } catch (e: Exception) { 0 }
+                        networkType = when (typeInt) {
+                            android.telephony.TelephonyManager.NETWORK_TYPE_GPRS, android.telephony.TelephonyManager.NETWORK_TYPE_EDGE,
+                            android.telephony.TelephonyManager.NETWORK_TYPE_CDMA, android.telephony.TelephonyManager.NETWORK_TYPE_1xRTT,
+                            android.telephony.TelephonyManager.NETWORK_TYPE_IDEN -> "2G"
+
+                            android.telephony.TelephonyManager.NETWORK_TYPE_UMTS, android.telephony.TelephonyManager.NETWORK_TYPE_EVDO_0,
+                            android.telephony.TelephonyManager.NETWORK_TYPE_EVDO_A, android.telephony.TelephonyManager.NETWORK_TYPE_HSDPA,
+                            android.telephony.TelephonyManager.NETWORK_TYPE_HSUPA, android.telephony.TelephonyManager.NETWORK_TYPE_HSPA,
+                            android.telephony.TelephonyManager.NETWORK_TYPE_EVDO_B, android.telephony.TelephonyManager.NETWORK_TYPE_EHRPD,
+                            android.telephony.TelephonyManager.NETWORK_TYPE_HSPAP -> "3G"
+
+                            android.telephony.TelephonyManager.NETWORK_TYPE_LTE -> "4G"
+                            android.telephony.TelephonyManager.NETWORK_TYPE_NR -> "5G"
+                            else -> "Unknown"
+                        }
+                    }
+
+                    val payloadJson = JSONObject().apply {
+                        put("type", "DEVICE_STATUS")
+                        put("battery", batteryLevel)
+                        put("bluetooth", bluetoothStatus)
+                        put("data_status", dataStatus)
+                        put("operator", operator)
+                        put("network_type", networkType)
+                    }
+                    val payloadStr = payloadJson.toString()
+
+                    if (payloadStr != lastBroadcastedStatus) {
+                        lastBroadcastedStatus = payloadStr
+                        webSocketSessions.toList().forEach { session ->
+                            launch {
+                                try {
+                                    session.send(Frame.Text(payloadStr))
+                                } catch (e: Exception) {
+                                    // Ignore
+                                }
+                            }
+                        }
+                    }
+
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error in status monitor", e)
+                }
+
+                delay(3000) // Poll every 3 seconds
+            }
+        }
+    }
+
+    private fun stopStatusMonitor() {
+        statusMonitorJob?.cancel()
+        statusMonitorJob = null
+        lastBroadcastedStatus = null
+        Log.d(TAG, "Stopped DeviceStatusMonitor")
     }
 
     private fun getDeviceFriendlyName(context: Context): String {
@@ -216,6 +370,10 @@ object SmsServer {
             Log.d(TAG, "Server is already running.")
             return
         }
+
+        // Initialize display states from stored prefs
+        serviceEnabledState.value = getServiceEnabled(context)
+        sftpServerEnabledState.value = getSftpServerEnabled(context)
 
         CoroutineScope(Dispatchers.IO).launch {
             try {
@@ -405,6 +563,8 @@ object SmsServer {
                             } catch (e: Exception) {
                                 Log.e(TAG, "Error syncing initial state to WS client", e)
                             }
+                            
+                            startStatusMonitor(context)
 
                             var lastPong = System.currentTimeMillis()
                             val pingJob = launch {
@@ -441,6 +601,9 @@ object SmsServer {
                                 Log.d(TAG, "WebSocket disconnected from $clientIp")
                                 webSocketSessions.remove(this)
                                 isClientConnectedState.value = webSocketSessions.isNotEmpty()
+                                if (webSocketSessions.isEmpty()) {
+                                    stopStatusMonitor()
+                                }
                             }
                         }
 
@@ -451,6 +614,7 @@ object SmsServer {
                                 ContentType.Application.Json
                             )
                         }
+
                         get("/sms") {
                             val token = call.request.queryParameters["token"]
                             if (!isAuthorized.get() || token != restToken) {
@@ -485,9 +649,136 @@ object SmsServer {
                                 call.respondText("{\"error\":\"${e.message}\"}", ContentType.Application.Json, HttpStatusCode.InternalServerError)
                             }
                         }
+
+                        get("/contacts") {
+                            val token = call.request.queryParameters["token"]
+                            if (!isAuthorized.get() || token != restToken) {
+                                call.respondText("{\"error\":\"Unauthorized\"}", ContentType.Application.Json, HttpStatusCode.Unauthorized)
+                                return@get
+                            }
+
+                            try {
+                                val contacts = ContactHelper.getAllContacts(context)
+                                val jsonBuilder = StringBuilder("[")
+                                contacts.forEachIndexed { index, contact ->
+                                    jsonBuilder.append("{")
+                                    jsonBuilder.append("\"name\":\"${contact.name.replace("\"", "\\\"")}\",")
+                                    jsonBuilder.append("\"number\":\"${contact.number.replace("\"", "\\\"")}\"")
+                                    jsonBuilder.append("}")
+                                    if (index < contacts.size - 1) jsonBuilder.append(",")
+                                }
+                                jsonBuilder.append("]")
+                                call.respondText(jsonBuilder.toString(), ContentType.Application.Json)
+                            } catch (e: Exception) {
+                                Log.e(TAG, "Error fetching contacts", e)
+                                call.respondText("{\"error\":\"${e.message}\"}", ContentType.Application.Json, HttpStatusCode.InternalServerError)
+                            }
+                        }
+
+                        post("/call") {
+                            val token = call.request.queryParameters["token"]
+                            val number = call.request.queryParameters["number"]
+                            if (!isAuthorized.get() || token != restToken) {
+                                call.respondText("{\"error\":\"Unauthorized\"}", ContentType.Application.Json, HttpStatusCode.Unauthorized)
+                                return@post
+                            }
+
+                            if (number.isNullOrEmpty()) {
+                                call.respondText("{\"error\":\"Number required\"}", ContentType.Application.Json, HttpStatusCode.BadRequest)
+                                return@post
+                            }
+
+                            try {
+                                if (ContextCompat.checkSelfPermission(context, Manifest.permission.CALL_PHONE) == PackageManager.PERMISSION_GRANTED) {
+                                    val contactName = ContactHelper.getContactName(context, number)
+                                    callerNumber = contactName ?: number
+
+                                    val intent = Intent(Intent.ACTION_CALL).apply {
+                                        data = Uri.parse("tel:$number")
+                                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                    }
+                                    context.startActivity(intent)
+                                    call.respondText("{\"status\":\"calling\"}", ContentType.Application.Json)
+                                } else {
+                                    call.respondText("{\"error\":\"Permission denied\"}", ContentType.Application.Json, HttpStatusCode.Forbidden)
+                                }
+                            } catch (e: Exception) {
+                                Log.e(TAG, "Call error", e)
+                                call.respondText("{\"error\":\"${e.message}\"}", ContentType.Application.Json, HttpStatusCode.InternalServerError)
+                            }
+                        }
+                        post("/ring") {
+                            val token = call.request.queryParameters["token"]
+                            val action = call.request.queryParameters["action"] ?: "start"
+                            
+                            if (!isAuthorized.get() || token != restToken) {
+                                call.respondText("{\"error\":\"Unauthorized\"}", ContentType.Application.Json, HttpStatusCode.Unauthorized)
+                                return@post
+                            }
+
+                            try {
+                                if (action == "start") {
+                                    activeRingtone?.stop()
+                                    val uri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM) 
+                                        ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
+                                    
+                                    activeRingtone = RingtoneManager.getRingtone(context, uri)
+                                    activeRingtone?.audioAttributes = AudioAttributes.Builder()
+                                        .setUsage(AudioAttributes.USAGE_ALARM)
+                                        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                                        .build()
+                                    
+                                    activeRingtone?.play()
+
+                                    // Launch Full-Screen Intent Activity
+                                    val intent = Intent(context, FindMyPhoneActivity::class.java).apply {
+                                        flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
+                                    }
+                                    val pendingIntent = PendingIntent.getActivity(
+                                        context, 0, intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                                    )
+
+                                    val channelId = "phone_hub_ringing"
+                                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                                        val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                                        val channel = NotificationChannel(
+                                            channelId,
+                                            "Find My Phone",
+                                            NotificationManager.IMPORTANCE_HIGH
+                                        ).apply {
+                                            description = "Used to show a full-screen overlay when finding your phone"
+                                        }
+                                        notificationManager.createNotificationChannel(channel)
+                                    }
+
+                                    val notification = NotificationCompat.Builder(context, channelId)
+                                        .setSmallIcon(R.mipmap.ic_launcher)
+                                        .setContentTitle("Find My Phone")
+                                        .setContentText("Your phone is ringing")
+                                        .setPriority(NotificationCompat.PRIORITY_HIGH)
+                                        .setCategory(NotificationCompat.CATEGORY_ALARM)
+                                        .setFullScreenIntent(pendingIntent, true)
+                                        .setOngoing(true)
+                                        .setAutoCancel(false)
+                                        .build()
+
+                                    val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                                    notificationManager.notify(778899, notification)
+
+                                    call.respondText("{\"status\":\"ringing\"}", ContentType.Application.Json)
+                                } else {
+                                    stopRinging(context)
+                                    call.respondText("{\"status\":\"stopped\"}", ContentType.Application.Json)
+                                }
+                            } catch (e: Exception) {
+                                Log.e(TAG, "Ringtone error", e)
+                                call.respondText("{\"error\":\"${e.message}\"}", ContentType.Application.Json, HttpStatusCode.InternalServerError)
+                            }
+                        }
                     }
                 }
                 server?.start(wait = false)
+                isSmsServerActualRunningState.value = true
                 Log.d(TAG, "Server engine started successfully.")
             } catch (e: Exception) {
                 Log.e(TAG, "Error starting server", e)
@@ -500,25 +791,31 @@ object SmsServer {
         Log.d(TAG, "Stopping server...")
         server?.stop(1000, 2000)
         server = null
+        isSmsServerActualRunningState.value = false
     }
 
-    fun getLocalIpAddress(): String {
-        try {
-            val interfaces = java.net.NetworkInterface.getNetworkInterfaces()
-            while (interfaces.hasMoreElements()) {
-                val networkInterface = interfaces.nextElement()
-                val addresses = networkInterface.inetAddresses
-                while (addresses.hasMoreElements()) {
-                    val address = addresses.nextElement()
-                    if (!address.isLoopbackAddress && address is java.net.Inet4Address) {
-                        return address.hostAddress ?: "0.0.0.0"
+    fun stopRinging(context: Context) {
+        activeRingtone?.stop()
+        activeRingtone = null
+        
+        val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        notificationManager.cancel(778899)
+        
+        // Notify any connected WebSocket clients so they can reset their UI
+        SmsServer.broadcastToClients("{\"type\":\"FIND_MY_PHONE\",\"status\":\"stopped\"}")
+    }
+
+    fun broadcastToClients(message: String) {
+        CoroutineScope(Dispatchers.IO).launch {
+            webSocketSessions.toList().forEach { session ->
+                if (session.isActive) {
+                    try {
+                        session.send(Frame.Text(message))
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Failed to send broadcast", e)
                     }
                 }
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error getting IP", e)
         }
-        return "0.0.0.0"
     }
 }
-

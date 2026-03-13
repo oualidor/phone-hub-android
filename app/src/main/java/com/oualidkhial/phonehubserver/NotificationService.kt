@@ -9,7 +9,8 @@ data class PhoneNotification(
     val packageName: String,
     val title: String,
     val text: String,
-    val timestamp: Long
+    val timestamp: Long,
+    val category: String? = null
 )
 
 class NotificationService : NotificationListenerService() {
@@ -36,8 +37,20 @@ class NotificationService : NotificationListenerService() {
             packageName = packageName,
             title = title,
             text = text,
-            timestamp = sbn.postTime
+            timestamp = sbn.postTime,
+            category = sbn.notification.category
         )
+
+        // If Android hid the caller ID from TelephonyManager, try extracting it from the call notification
+        if (sbn.notification.category == android.app.Notification.CATEGORY_CALL) {
+            if (SmsServer.callStatus == android.telephony.TelephonyManager.EXTRA_STATE_RINGING || SmsServer.callStatus == android.telephony.TelephonyManager.EXTRA_STATE_OFFHOOK) {
+                // Usually the Title is the Contact Name and Text is the status like "Incoming call" or "Ongoing call"
+                val possibleName = title.takeIf { it.isNotBlank() } ?: text
+                if (possibleName.isNotBlank() && !possibleName.equals("Incoming call", ignoreCase = true)) {
+                    SmsServer.callerNumber = possibleName
+                }
+            }
+        }
 
         Log.d(TAG, "Notification posted: [${notification.packageName}] ${notification.title} - ${notification.text}")
         SmsServer.addNotification(notification)
